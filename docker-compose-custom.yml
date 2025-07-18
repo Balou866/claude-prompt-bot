@@ -1,0 +1,226 @@
+version: '3.8'
+
+services:
+  claude-bot:
+    image: python:3.11-alpine
+    container_name: claude-auto-message-custom
+    environment:
+      - TZ=Europe/Paris
+      - CLAUDE_SESSION_KEY=coller_votre_session_key
+      
+      # 🕕 PERSONNALISATION DES HORAIRES ET MESSAGES
+      # Format: HH:MM (24h) - Modifier les heures ci-dessous selon vos besoins
+      - SCHEDULE_1=06:00|quelle est la météo du jour à Marseille ?
+      - SCHEDULE_2=11:00|peux-tu me donner un résumé des actualités importantes ?
+      - SCHEDULE_3=16:00|quels sont les événements importants de cette fin de journée ?
+      
+      # 📝 AJOUTER D'AUTRES HORAIRES (optionnel)
+      # Décommenter et modifier selon vos besoins :
+      # - SCHEDULE_4=20:00|bonne soirée ! comment s'est passée ta journée ?
+      # - SCHEDULE_5=22:00|bonne nuit ! à demain
+      
+    volumes:
+      - claude_logs:/app/logs
+    working_dir: /app
+    command: 
+      - sh
+      - -c
+      - |
+        apk add --no-cache curl tzdata dcron
+        pip install requests beautifulsoup4
+        mkdir -p /app/logs
+        
+        cat > claude_custom_scheduler.py << 'SCRIPT_END'
+        import requests
+        import os
+        import time
+        import json
+        from datetime import datetime, time as dt_time
+        
+        class ClaudeCustomScheduler:
+            def __init__(self):
+                self.base_url = "https://claude.ai"
+                self.session = requests.Session()
+                self.session_key = os.getenv("CLAUDE_SESSION_KEY")
+                
+                # Lecture dynamique des horaires depuis les variables d'environnement
+                self.schedule = self.load_schedule_from_env()
+                
+                self.session.headers.update({
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Referer": "https://claude.ai/chats"
+                })
+                
+                if self.session_key:
+                    self.session.cookies.set("sessionKey", self.session_key, domain="claude.ai")
+        
+            def load_schedule_from_env(self):
+                schedule = []
+                i = 1
+                while True:
+                    schedule_var = os.getenv(f"SCHEDULE_{i}")
+                    if not schedule_var:
+                        break
+                    
+                    try:
+                        time_str, message = schedule_var.split("|", 1)
+                        hour, minute = map(int, time_str.split(":"))
+                        schedule.append({
+                            "time": dt_time(hour, minute),
+                            "message": message,
+                            "label": f"SCHEDULE_{i}"
+                        })
+                        i += 1
+                    except Exception as e:
+                        print(f"❌ Erreur parsing SCHEDULE_{i}: {e}")
+                        i += 1
+                        continue
+                
+                if not schedule:
+                    print("⚠️ Aucun horaire configuré, utilisation des horaires par défaut")
+                    schedule = [
+                        {"time": dt_time(6, 0), "message": "Bonjour ! Comment ça va ?", "label": "DEFAULT_1"},
+                        {"time": dt_time(18, 0), "message": "Bonne soirée !", "label": "DEFAULT_2"},
+                    ]
+                
+                return schedule
+        
+            def get_organization_id(self):
+                try:
+                    response = self.session.get(f"{self.base_url}/api/organizations")
+                    if response.status_code == 200:
+                        orgs = response.json()
+                        return orgs[0]["uuid"] if orgs else None
+                except Exception as e:
+                    print(f"Erreur organisation: {e}")
+                return None
+        
+            def create_conversation(self, org_id, time_slot):
+                try:
+                    # Créer un titre plus casual basé sur l'heure
+                    hour = time_slot.hour
+                    if 5 <= hour < 12:
+                        period = "Matin"
+                    elif 12 <= hour < 17:
+                        period = "Après-midi"
+                    elif 17 <= hour < 21:
+                        period = "Soirée"
+                    else:
+                        period = "Nuit"
+                    
+                    payload = {
+                        "uuid": None,
+                        "name": f"Chat {period} {hour}h - {datetime.now().strftime('%d/%m')}"
+                    }
+                    response = self.session.post(
+                        f"{self.base_url}/api/organizations/{org_id}/chat_conversations",
+                        json=payload
+                    )
+                    if response.status_code == 201:
+                        return response.json()["uuid"]
+                except Exception as e:
+                    print(f"Erreur conversation: {e}")
+                return None
+        
+            def send_message(self, org_id, conversation_id, message):
+                try:
+                    payload = {"prompt": message}
+                    response = self.session.post(
+                        f"{self.base_url}/api/organizations/{org_id}/chat_conversations/{conversation_id}/completion",
+                        json=payload
+                    )
+                    
+                    if response.status_code == 200:
+                        print(f"✅ Message envoyé: {message[:50]}... à {datetime.now()}")
+                        return True
+                    else:
+                        print(f"❌ Échec envoi: {response.status_code}")
+                        
+                except Exception as e:
+                    print(f"Erreur envoi: {e}")
+                return False
+        
+            def send_scheduled_message(self, slot):
+                print(f"🤖 Envoi programmé {slot['time']} ({slot['label']}) - {datetime.now()}")
+                
+                if not self.session_key:
+                    print("❌ Session key manquante")
+                    return False
+                    
+                org_id = self.get_organization_id()
+                if not org_id:
+                    print("❌ Organisation introuvable")
+                    return False
+                    
+                conv_id = self.create_conversation(org_id, slot['time'])
+                if not conv_id:
+                    print("❌ Conversation impossible")
+                    return False
+                    
+                return self.send_message(org_id, conv_id, slot['message'])
+        
+            def scheduler(self):
+                print(f"🕐 Scheduler personnalisé démarré")
+                print("📅 Horaires programmés:")
+                for slot in self.schedule:
+                    print(f"  - {slot['time']} ({slot['label']}): {slot['message'][:50]}...")
+                
+                # Dictionnaire pour tracker les envois par jour
+                last_runs = {}
+                
+                while True:
+                    now = datetime.now()
+                    current_time = now.time()
+                    current_date = now.date()
+                    
+                    # Vérifier chaque créneau horaire
+                    for slot in self.schedule:
+                        slot_key = f"{slot['time']}"
+                        last_run_key = f"{current_date}_{slot_key}"
+                        
+                        if (current_time.hour == slot['time'].hour and 
+                            current_time.minute == slot['time'].minute and 
+                            last_run_key not in last_runs):
+                            
+                            print(f"⏰ Il est {current_time} - Envoi {slot['label']} programmé")
+                            success = self.send_scheduled_message(slot)
+                            
+                            if success:
+                                last_runs[last_run_key] = True
+                                print(f"✅ Message {slot['label']} envoyé")
+                            else:
+                                print(f"❌ Échec envoi {slot['label']}")
+                    
+                    # Nettoyage des anciens runs (garde seulement aujourd'hui)
+                    keys_to_remove = [k for k in last_runs.keys() if not k.startswith(str(current_date))]
+                    for key in keys_to_remove:
+                        del last_runs[key]
+                    
+                    # Log de vie toutes les heures
+                    if current_time.minute == 0:
+                        next_slots = [s['time'] for s in self.schedule if s['time'] > current_time]
+                        if next_slots:
+                            print(f"💓 Service actif - {current_time} - Prochain: {min(next_slots)}")
+                        else:
+                            print(f"💓 Service actif - {current_time} - Prochain: demain {self.schedule[0]['time']}")
+                    
+                    time.sleep(60)
+        
+        if __name__ == "__main__":
+            scheduler = ClaudeCustomScheduler()
+            scheduler.scheduler()
+        SCRIPT_END
+        
+        echo "✅ Script personnalisé créé"
+        echo "📝 Vérification du script..."
+        ls -la claude_custom_scheduler.py
+        echo "🔍 Test syntaxe Python..."
+        python -c "import claude_custom_scheduler; print('Import OK')" 2>&1 || echo "❌ Erreur import"
+        echo "🚀 Lancement du scheduler personnalisé..."
+        python -u claude_custom_scheduler.py 2>&1
+    restart: unless-stopped
+
+volumes:
+  claude_logs:
